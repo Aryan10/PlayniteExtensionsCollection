@@ -11,6 +11,7 @@ using System.Windows;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using System.Threading.Tasks;
 
 namespace ExtraMetadataLoader
 {
@@ -109,7 +110,7 @@ namespace ExtraMetadataLoader
             UpdateLogo();
         }
 
-        private void UpdateLogo()
+        private async void UpdateLogo()
         {
             //The GameContextChanged method is rised even when the control
             //is not in the active view. To prevent unecessary processing we
@@ -138,13 +139,30 @@ namespace ExtraMetadataLoader
                 return;
             }
 
-            var logoPath = Path.Combine(PlayniteApi.Paths.ConfigurationPath, "ExtraMetadata", "games", gameContext.Id.ToString(), "Logo.png");
-            if (!FileSystem.FileExists(logoPath))
+            var targetGame = gameContext;
+            var logoPath = Path.Combine(PlayniteApi.Paths.ConfigurationPath, "ExtraMetadata", "games", targetGame.Id.ToString(), "Logo.png");
+            var maxWidth = Convert.ToInt32(_settings.LogoMaxWidth);
+            var maxHeight = Convert.ToInt32(_settings.LogoMaxHeight);
+
+            var adjustedBitmap = await Task.Run(() =>
+            {
+                if (!FileSystem.FileExists(logoPath))
+                {
+                    return null;
+                }
+                return CreateResizedBitmapImageFromPath(logoPath, maxWidth, maxHeight);
+            });
+
+            if (gameContext == null || gameContext.Id != targetGame.Id)
             {
                 return;
             }
 
-            var adjustedBitmap = CreateResizedBitmapImageFromPath(logoPath, Convert.ToInt32(_settings.LogoMaxWidth), Convert.ToInt32(_settings.LogoMaxHeight));
+            if (adjustedBitmap == null)
+            {
+                return;
+            }
+
             LogoImage.Source = adjustedBitmap;
             _settings.IsLogoAvailable = true;
             ControlVisibility = Visibility.Visible;

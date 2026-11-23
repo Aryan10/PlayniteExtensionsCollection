@@ -60,14 +60,34 @@ namespace ExtraMetadataLoader
             }
         }
 
+        private static Uri EnsureMediaElementCompatibleUri(Uri uri)
+        {
+            if (uri == null)
+            {
+                return null;
+            }
+
+            if (uri.IsAbsoluteUri && uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+            {
+                var builder = new UriBuilder(uri) { Scheme = "http", Port = -1 };
+                return builder.Uri;
+            }
+
+            return uri;
+        }
+
         private Uri videoSource;
         public Uri VideoSource
         {
             get => videoSource;
             set
             {
-                videoSource = value;
-                OnPropertyChanged();
+                var compatibleUri = EnsureMediaElementCompatibleUri(value);
+                if (videoSource != compatibleUri)
+                {
+                    videoSource = compatibleUri;
+                    OnPropertyChanged();
+                }
             }
         }
 
@@ -213,14 +233,23 @@ namespace ExtraMetadataLoader
             }
         }
 
-        private void UpdaterPlayerTimer_Tick(object sender, EventArgs e)
+        private async void UpdaterPlayerTimer_Tick(object sender, EventArgs e)
         {
             updatePlayerTimer.Stop();
-            if (SettingsModel.Settings.EnableVideoPlayer && currentGame != null)
+            if (!SettingsModel.Settings.EnableVideoPlayer || currentGame == null)
             {
-                UpdateGameVideoSources();
-                playingContextChanged();
+                return;
             }
+
+            var targetGame = currentGame;
+            var resolved = await Task.Run(() => ResolveGameVideoSources(targetGame));
+
+            if (currentGame == null || currentGame.Id != targetGame.Id)
+            {
+                return;
+            }
+
+            ApplyVideoSources(resolved);
         }
 
         private void timer_Tick(object sender, EventArgs e)
@@ -430,7 +459,12 @@ namespace ExtraMetadataLoader
 
         public void RefreshPlayer()
         {
-            ResetPlayerValues();
+            player.Pause();
+            VideoSource = null;
+            SettingsModel.Settings.IsVideoPlaying = false;
+            SettingsModel.Settings.IsAnyVideoAvailable = false;
+            SettingsModel.Settings.IsTrailerAvailable = false;
+            SettingsModel.Settings.IsMicrotrailerAvailable = false;
             ControlVisibility = Visibility.Collapsed;
             SettingsModel.Settings.NewContextVideoAvailable = false;
 
@@ -463,31 +497,40 @@ namespace ExtraMetadataLoader
             OnPropertyChanged(nameof(VideoPauseCommand));
         }
 
-        public void UpdateGameVideoSources()
+        private class ResolvedVideoSources
         {
-            if (currentGame == null)
+            public Uri TrailerVideoPath { get; set; }
+            public Uri MicroVideoPath { get; set; }
+            public bool IsTrailerAvailable { get; set; }
+            public bool IsMicrotrailerAvailable { get; set; }
+            public bool MultipleSourcesAvailable { get; set; }
+            public Uri SelectedVideoSource { get; set; }
+            public ActiveVideoType SelectedVideoType { get; set; } = ActiveVideoType.None;
+        }
+
+        private ResolvedVideoSources ResolveGameVideoSources(Game game)
+        {
+            var result = new ResolvedVideoSources();
+            if (game == null)
             {
-                return;
+                return result;
             }
 
-            var game = currentGame;
             var videoPath = Path.Combine(PlayniteApi.Paths.ConfigurationPath, "ExtraMetadata", "games", game.Id.ToString(), "VideoTrailer.mp4");
             if (FileSystem.FileExists(videoPath))
             {
-                SettingsModel.Settings.IsAnyVideoAvailable = true;
-                SettingsModel.Settings.IsTrailerAvailable = true;
-                trailerVideoPath = new Uri(videoPath);
+                result.IsTrailerAvailable = true;
+                result.TrailerVideoPath = new Uri(videoPath);
             }
 
             var videoMicroPath = Path.Combine(PlayniteApi.Paths.ConfigurationPath, "ExtraMetadata", "games", game.Id.ToString(), "VideoMicrotrailer.mp4");
             if (FileSystem.FileExists(videoMicroPath))
             {
-                SettingsModel.Settings.IsAnyVideoAvailable = true;
-                SettingsModel.Settings.IsMicrotrailerAvailable = true;
-                microVideoPath = new Uri(videoMicroPath);
+                result.IsMicrotrailerAvailable = true;
+                result.MicroVideoPath = new Uri(videoMicroPath);
             }
 
-            if (SettingsModel.Settings.StreamSteamVideosOnDemand && trailerVideoPath == null)
+            if (SettingsModel.Settings.StreamSteamVideosOnDemand && result.TrailerVideoPath == null)
             {
                 var gameDataPath = Path.Combine(pluginDataPath, $"{game.Id}_SteamAppDetails.json");
                 var jsonDownloadValid = true;
@@ -497,7 +540,15 @@ namespace ExtraMetadataLoader
                     if (steamId != null)
                     {
                         var url = string.Format(@"https://store.steampowered.com/api/appdetails?appids={0}", steamId);
-                        HttpRequestFactory.GetHttpFileRequest().WithUrl(url).WithDownloadTo(gameDataPath).DownloadFile();
+                        var downloadResult = HttpRequestFactory.GetHttpFileRequest().WithUrl(url).WithDownloadTo(gameDataPath).DownloadFile();
+                        if (!downloadResult.IsSuccess)
+                        {
+                            jsonDownloadValid = false;
+                        }
+                    }
+                    else
+                    {
+                        jsonDownloadValid = false;
                     }
                 }
 
@@ -507,68 +558,181 @@ namespace ExtraMetadataLoader
                     try
                     {
                         var parsedData = Serialization.FromJson<Dictionary<string, SteamAppDetails>>(jsonString);
-                        if (parsedData.Keys?.Any() == true)
+                        if (parsedData?.Keys?.Any() == true)
                         {
                             var response = parsedData[parsedData.Keys.First()];
-                            if (response.success == true && response.data != null)
+                            if (response?.success == true && response.data?.Movies?.Count > 0)
                             {
-                                if (trailerVideoPath == null)
+                                bool highQuality = SettingsModel.Settings.StreamSteamHighQuality;
+                                foreach (var movie in response.data.Movies)
                                 {
-                                    if (SettingsModel.Settings.StreamSteamHighQuality)
+                                    if (movie == null)
                                     {
-                                        trailerVideoPath = response.data.Movies?[0].Mp4.Max;
+                                        continue;
                                     }
-                                    else
+
+                                    // 1. Direct Mp4 in API response if available (older games)
+                                    if (movie.Mp4 != null)
                                     {
-                                        trailerVideoPath = response.data.Movies?[0].Mp4.Q480;
+                                        var directMp4 = highQuality ? (movie.Mp4.Max ?? movie.Mp4.Q480) : (movie.Mp4.Q480 ?? movie.Mp4.Max);
+                                        if (directMp4 != null)
+                                        {
+                                            result.TrailerVideoPath = directMp4;
+                                            break;
+                                        }
                                     }
-                                    SettingsModel.Settings.IsAnyVideoAvailable = true;
-                                    SettingsModel.Settings.IsTrailerAvailable = true;
+
+                                    // 2. Steam CDN direct MP4 using movie.Id (modern Steam games where API omits mp4)
+                                    // Use http:// to prevent WPF MediaPlayerState.OpenMedia NullReferenceException on non-ClickOnce apps
+                                    if (movie.Id > 0)
+                                    {
+                                        var cdnCandidate = new Uri(highQuality
+                                            ? $"http://steamcdn-a.akamaihd.net/steam/apps/{movie.Id}/movie_max.mp4"
+                                            : $"http://steamcdn-a.akamaihd.net/steam/apps/{movie.Id}/movie480.mp4");
+
+                                        bool reachable = false;
+                                        try
+                                        {
+                                            var req = (HttpWebRequest)WebRequest.Create(cdnCandidate);
+                                            req.Method = "HEAD";
+                                            req.Timeout = 1500;
+                                            using (var resp = (HttpWebResponse)req.GetResponse())
+                                            {
+                                                if (resp.StatusCode == HttpStatusCode.OK)
+                                                {
+                                                    reachable = true;
+                                                }
+                                            }
+                                        }
+                                        catch
+                                        {
+                                            if (highQuality)
+                                            {
+                                                try
+                                                {
+                                                    var cdnCandidate480 = new Uri($"http://steamcdn-a.akamaihd.net/steam/apps/{movie.Id}/movie480.mp4");
+                                                    var req480 = (HttpWebRequest)WebRequest.Create(cdnCandidate480);
+                                                    req480.Method = "HEAD";
+                                                    req480.Timeout = 1500;
+                                                    using (var resp480 = (HttpWebResponse)req480.GetResponse())
+                                                    {
+                                                        if (resp480.StatusCode == HttpStatusCode.OK)
+                                                        {
+                                                            cdnCandidate = cdnCandidate480;
+                                                            reachable = true;
+                                                        }
+                                                    }
+                                                }
+                                                catch { }
+                                            }
+                                        }
+
+                                        if (reachable)
+                                        {
+                                            result.TrailerVideoPath = cdnCandidate;
+                                            break;
+                                        }
+                                    }
+
+                                    // 3. Fallback to HlsH264 if available
+                                    if (result.TrailerVideoPath == null && movie.HlsH264 != null)
+                                    {
+                                        result.TrailerVideoPath = EnsureMediaElementCompatibleUri(movie.HlsH264);
+                                        break;
+                                    }
+                                }
+
+                                // 4. If HEAD timed out or failed, fallback to first movie CDN candidate
+                                if (result.TrailerVideoPath == null && response.data.Movies[0].Id > 0)
+                                {
+                                    result.TrailerVideoPath = new Uri($"http://steamcdn-a.akamaihd.net/steam/apps/{response.data.Movies[0].Id}/movie_max.mp4");
+                                }
+
+                                if (result.TrailerVideoPath != null)
+                                {
+                                    result.IsTrailerAvailable = true;
                                 }
                             }
                         }
                     }
-                    catch
+                    catch (Exception ex)
                     {
                         // According to #169, it seems that for some reason the uri redirects to
                         // another page and a html source gets downloaded so it needs to be deleted
-                        logger.Error($"Error deserializing steam appdetails json file in {gameDataPath}");
+                        logger.Error(ex, $"Error deserializing steam appdetails json file in {gameDataPath}");
                         FileSystem.DeleteFile(gameDataPath);
                     }
                 }
             }
 
-            if (trailerVideoPath != null && microVideoPath != null)
+            if (result.TrailerVideoPath != null && result.MicroVideoPath != null)
             {
-                multipleSourcesAvailable = true;
+                result.MultipleSourcesAvailable = true;
             }
 
             if (useMicrovideosSource)
             {
-                if (microVideoPath != null)
+                if (result.MicroVideoPath != null)
                 {
-                    VideoSource = microVideoPath;
-                    activeVideoType = ActiveVideoType.Microtrailer;
+                    result.SelectedVideoSource = result.MicroVideoPath;
+                    result.SelectedVideoType = ActiveVideoType.Microtrailer;
                 }
-                else if (trailerVideoPath != null && SettingsModel.Settings.FallbackVideoSource)
+                else if (result.TrailerVideoPath != null && SettingsModel.Settings.FallbackVideoSource)
                 {
-                    VideoSource = trailerVideoPath;
-                    activeVideoType = ActiveVideoType.Trailer;
+                    result.SelectedVideoSource = result.TrailerVideoPath;
+                    result.SelectedVideoType = ActiveVideoType.Trailer;
                 }
             }
             else
             {
-                if (trailerVideoPath != null)
+                if (result.TrailerVideoPath != null)
                 {
-                    VideoSource = trailerVideoPath;
-                    activeVideoType = ActiveVideoType.Trailer;
+                    result.SelectedVideoSource = result.TrailerVideoPath;
+                    result.SelectedVideoType = ActiveVideoType.Trailer;
                 }
-                else if (microVideoPath != null && SettingsModel.Settings.FallbackVideoSource)
+                else if (result.MicroVideoPath != null && SettingsModel.Settings.FallbackVideoSource)
                 {
-                    VideoSource = microVideoPath;
-                    activeVideoType = ActiveVideoType.Microtrailer;
+                    result.SelectedVideoSource = result.MicroVideoPath;
+                    result.SelectedVideoType = ActiveVideoType.Microtrailer;
                 }
             }
+
+            return result;
+        }
+
+        private void ApplyVideoSources(ResolvedVideoSources resolved)
+        {
+            if (resolved == null || resolved.SelectedVideoSource == null)
+            {
+                ResetPlayerValues();
+                ControlVisibility = Visibility.Collapsed;
+                SettingsModel.Settings.NewContextVideoAvailable = false;
+                return;
+            }
+
+            trailerVideoPath = resolved.TrailerVideoPath;
+            microVideoPath = resolved.MicroVideoPath;
+            multipleSourcesAvailable = resolved.MultipleSourcesAvailable;
+            activeVideoType = resolved.SelectedVideoType;
+
+            SettingsModel.Settings.IsTrailerAvailable = resolved.IsTrailerAvailable;
+            SettingsModel.Settings.IsMicrotrailerAvailable = resolved.IsMicrotrailerAvailable;
+            SettingsModel.Settings.IsAnyVideoAvailable = resolved.IsTrailerAvailable || resolved.IsMicrotrailerAvailable;
+
+            VideoSource = resolved.SelectedVideoSource;
+
+            playingContextChanged();
+        }
+
+        public void UpdateGameVideoSources()
+        {
+            if (currentGame == null)
+            {
+                return;
+            }
+
+            var resolved = ResolveGameVideoSources(currentGame);
+            ApplyVideoSources(resolved);
         }
 
         private string GetSteamId(Game game)

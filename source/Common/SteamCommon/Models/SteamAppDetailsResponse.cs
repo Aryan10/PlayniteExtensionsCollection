@@ -91,6 +91,12 @@ namespace SteamCommon.Models
                 [SerializationPropertyName("mp4")]
                 public Mp4 Mp4 { get; set; }
 
+                [SerializationPropertyName("hls_h264")]
+                public Uri HlsH264 { get; set; }
+
+                [SerializationPropertyName("dash_h264")]
+                public Uri DashH264 { get; set; }
+
                 [SerializationPropertyName("highlight")]
                 public bool Highlight { get; set; }
             }
