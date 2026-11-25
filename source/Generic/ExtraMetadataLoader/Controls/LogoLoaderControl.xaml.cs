@@ -7,6 +7,7 @@ using System;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
@@ -109,7 +110,7 @@ namespace ExtraMetadataLoader
             UpdateLogo();
         }
 
-        private void UpdateLogo()
+        private async void UpdateLogo()
         {
             //The GameContextChanged method is rised even when the control
             //is not in the active view. To prevent unecessary processing we
@@ -138,15 +139,28 @@ namespace ExtraMetadataLoader
                 return;
             }
 
-            var logoPath = Path.Combine(PlayniteApi.Paths.ConfigurationPath, "ExtraMetadata", "games", gameContext.Id.ToString(), "Logo.png");
-            if (!FileSystem.FileExists(logoPath))
-            {
-                return;
-            }
+            var targetGame = gameContext;
+            var logoPath = Path.Combine(PlayniteApi.Paths.ConfigurationPath, "ExtraMetadata", "games", targetGame.Id.ToString(), "Logo.png");
+            var maxWidth = Convert.ToInt32(_settings.LogoMaxWidth);
+            var maxHeight = Convert.ToInt32(_settings.LogoMaxHeight);
 
             try
             {
-                var adjustedBitmap = CreateResizedBitmapImageFromPath(logoPath, Convert.ToInt32(_settings.LogoMaxWidth), Convert.ToInt32(_settings.LogoMaxHeight));
+                var adjustedBitmap = await Task.Run(() =>
+                {
+                    if (!FileSystem.FileExists(logoPath))
+                    {
+                        return null;
+                    }
+
+                    return CreateResizedBitmapImageFromPath(logoPath, maxWidth, maxHeight);
+                });
+
+                if (gameContext == null || gameContext.Id != targetGame.Id || adjustedBitmap == null)
+                {
+                    return;
+                }
+
                 LogoImage.Source = adjustedBitmap;
                 _settings.IsLogoAvailable = true;
                 ControlVisibility = Visibility.Visible;
